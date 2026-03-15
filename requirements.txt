@@ -1,2 +1,1 @@
-nbformat>=5.0.0
-nbconvert>=7.0.0
+# No external dependencies required - uses only Python standard library (json, os, argparse)
