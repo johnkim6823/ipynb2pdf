@@ -1,169 +1,210 @@
 #!/usr/bin/env python3
 """
-ipynb2pdf: Convert Jupyter notebooks to A4 PDF files
+ipynb2py: Convert between Jupyter notebooks (.ipynb) and Python scripts (.py)
+
+Conversion rules:
+  ipynb -> py: Markdown cells are commented with '# ' prefix per line.
+               Code cells are kept as-is.
+  py -> ipynb: Lines starting with '# ' become markdown cells.
+               Other lines become code cells.
 """
 import argparse
+import json
 import os
 import sys
-import nbformat
-from nbconvert import HTMLExporter
-from subprocess import run, CalledProcessError
 
 
-def check_wkhtmltopdf():
-    """Check if wkhtmltopdf is installed"""
-    try:
-        result = run(['wkhtmltopdf', '--version'], capture_output=True)
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-def convert_ipynb_to_pdf(ipynb_path, output_path=None, margin_mm=25):
+def ipynb_to_py(ipynb_path, output_path=None):
     """
-    Convert a Jupyter notebook to A4 PDF
+    Convert a Jupyter notebook (.ipynb) to a Python script (.py).
 
-    Args:
-        ipynb_path: Path to the input .ipynb file
-        output_path: Path to the output .pdf file (optional)
-        margin_mm: Margin size in millimeters (default: 25)
-
-    Returns:
-        Path to the generated PDF file
+    Markdown cells are converted to comments with '# ' prefix.
+    Code cells are kept as-is.
+    Cells are separated by a blank line.
     """
-    # Check if input file exists
     if not os.path.exists(ipynb_path):
         raise FileNotFoundError(f"Input file not found: {ipynb_path}")
 
-    # Check if wkhtmltopdf is installed
-    if not check_wkhtmltopdf():
-        raise RuntimeError(
-            "wkhtmltopdf is not installed. Please install it:\n"
-            "  Ubuntu/Debian: sudo apt-get install -y wkhtmltopdf\n"
-            "  macOS: brew install wkhtmltopdf\n"
-            "  Windows: Download from https://wkhtmltopdf.org/downloads.html"
-        )
-
-    # Determine output path
     if output_path is None:
-        output_path = ipynb_path.replace('.ipynb', '.pdf')
+        base, _ = os.path.splitext(ipynb_path)
+        output_path = base + '.py'
 
-    # Read the notebook
-    print(f"Reading notebook: {ipynb_path}")
     with open(ipynb_path, 'r', encoding='utf-8') as f:
-        notebook_content = nbformat.read(f, as_version=4)
+        notebook = json.load(f)
 
-    # Setup HTML exporter with embed_images enabled
-    html_exporter = HTMLExporter()
-    html_exporter.exclude_input = False
-    html_exporter.embed_images = True
+    lines = []
+    cells = notebook.get('cells', [])
 
-    # Custom CSS for A4 formatting
-    custom_css = """
-<style>
-    /* Page margins and layout */
-    body {
-        margin: 0;
-        padding: 10px;
-        font-family: Arial, sans-serif;
+    for i, cell in enumerate(cells):
+        cell_type = cell.get('cell_type', 'code')
+        source = cell.get('source', [])
+
+        # source can be a list of strings or a single string
+        if isinstance(source, list):
+            source_text = ''.join(source)
+        else:
+            source_text = source
+
+        if not source_text:
+            continue
+
+        if cell_type == 'markdown':
+            # Prefix each line with '# '
+            for line in source_text.split('\n'):
+                lines.append('# ' + line)
+        else:
+            # Code cell: keep as-is
+            lines.append(source_text)
+
+        # Add blank line between cells
+        if i < len(cells) - 1:
+            lines.append('')
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+
+    print(f"Converted: {ipynb_path} -> {output_path}")
+    return output_path
+
+
+def py_to_ipynb(py_path, output_path=None):
+    """
+    Convert a Python script (.py) to a Jupyter notebook (.ipynb).
+
+    Lines starting with '# ' become markdown cells (the '# ' prefix is stripped).
+    Other lines become code cells.
+    Consecutive lines of the same type are grouped into one cell.
+    """
+    if not os.path.exists(py_path):
+        raise FileNotFoundError(f"Input file not found: {py_path}")
+
+    if output_path is None:
+        base, _ = os.path.splitext(py_path)
+        output_path = base + '.ipynb'
+
+    with open(py_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    source_lines = content.split('\n')
+
+    # Remove trailing empty line if present
+    if source_lines and source_lines[-1] == '':
+        source_lines = source_lines[:-1]
+
+    cells = []
+    current_type = None  # 'markdown' or 'code'
+    current_lines = []
+
+    def flush_cell():
+        nonlocal current_type, current_lines
+        if current_lines is None or current_type is None:
+            return
+        # Remove trailing empty lines from the cell
+        while current_lines and current_lines[-1] == '':
+            current_lines.pop()
+        if not current_lines:
+            current_type = None
+            current_lines = []
+            return
+        source_text = '\n'.join(current_lines)
+        cell = {
+            'cell_type': current_type,
+            'metadata': {},
+            'source': source_text,
+        }
+        if current_type == 'code':
+            cell['execution_count'] = None
+            cell['outputs'] = []
+        cells.append(cell)
+        current_type = None
+        current_lines = []
+
+    for line in source_lines:
+        if line.startswith('# '):
+            # Markdown line - strip the '# ' prefix
+            md_line = line[2:]
+            if current_type == 'markdown':
+                current_lines.append(md_line)
+            else:
+                flush_cell()
+                current_type = 'markdown'
+                current_lines = [md_line]
+        elif line == '#':
+            # A lone '#' in a markdown block is an empty line
+            if current_type == 'markdown':
+                current_lines.append('')
+            else:
+                flush_cell()
+                current_type = 'markdown'
+                current_lines = ['']
+        elif line == '':
+            # Empty line: could be separator between cells or within a code block
+            if current_type == 'code':
+                current_lines.append('')
+            else:
+                # End of markdown block or separator
+                flush_cell()
+        else:
+            # Code line
+            if current_type == 'code':
+                current_lines.append(line)
+            else:
+                flush_cell()
+                current_type = 'code'
+                current_lines = [line]
+
+    flush_cell()
+
+    notebook = {
+        'nbformat': 4,
+        'nbformat_minor': 5,
+        'metadata': {
+            'kernelspec': {
+                'display_name': 'Python 3',
+                'language': 'python',
+                'name': 'python3'
+            },
+            'language_info': {
+                'name': 'python',
+                'version': '3.10.0'
+            }
+        },
+        'cells': cells
     }
 
-    /* Ensure images fit on A4 page */
-    img, .output {
-        max-width: 90%;
-        height: auto;
-    }
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(notebook, f, ensure_ascii=False, indent=1)
 
-    /* Compact cell spacing */
-    .input, .output {
-        margin: 5px 0;
-        padding: 5px;
-        font-size: 12px;
-    }
-
-    /* Code block styling */
-    .input_area {
-        background-color: #f5f5f5;
-        border-left: 3px solid #3b7ea1;
-        padding: 10px;
-        overflow-x: auto;
-    }
-
-    /* Output area styling */
-    .output_area {
-        padding: 5px;
-    }
-
-    /* Prevent page breaks inside code blocks */
-    .cell {
-        page-break-inside: avoid;
-    }
-</style>
-"""
-
-    # Convert to HTML
-    print("Converting to HTML...")
-    html_data, _ = html_exporter.from_notebook_node(notebook_content)
-    html_data = custom_css + html_data
-
-    # Save HTML temporarily
-    html_temp_path = ipynb_path.replace('.ipynb', '_temp.html')
-    with open(html_temp_path, 'w', encoding='utf-8') as f:
-        f.write(html_data)
-
-    # Convert HTML to PDF using wkhtmltopdf with A4 settings
-    print(f"Converting to A4 PDF: {output_path}")
-    try:
-        run([
-            'wkhtmltopdf',
-            '--margin-top', f'{margin_mm}mm',
-            '--margin-bottom', f'{margin_mm}mm',
-            '--margin-left', f'{margin_mm}mm',
-            '--margin-right', f'{margin_mm}mm',
-            '--page-size', 'A4',
-            '--encoding', 'UTF-8',
-            '--enable-local-file-access',
-            '--disable-external-links',
-            '--disable-javascript',
-            '--no-stop-slow-scripts',
-            html_temp_path,
-            output_path
-        ], check=True, capture_output=True)
-    except CalledProcessError as e:
-        print(f"Error during PDF conversion: {e.stderr.decode()}")
-        raise
-    finally:
-        # Clean up temporary HTML file
-        if os.path.exists(html_temp_path):
-            os.remove(html_temp_path)
-
-    print(f"✓ PDF generated successfully: {output_path}")
+    print(f"Converted: {py_path} -> {output_path}")
     return output_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert Jupyter notebook (.ipynb) to A4 PDF'
+        description='Convert between Jupyter notebook (.ipynb) and Python script (.py)'
     )
     parser.add_argument(
         'input',
-        help='Input .ipynb file path'
+        help='Input file path (.ipynb or .py)'
     )
     parser.add_argument(
         '-o', '--output',
-        help='Output .pdf file path (default: same name as input with .pdf extension)'
-    )
-    parser.add_argument(
-        '-m', '--margin',
-        type=int,
-        default=25,
-        help='Page margin in millimeters (default: 25)'
+        help='Output file path (default: auto-detect from input extension)'
     )
 
     args = parser.parse_args()
 
+    input_ext = os.path.splitext(args.input)[1].lower()
+
     try:
-        convert_ipynb_to_pdf(args.input, args.output, args.margin)
+        if input_ext == '.ipynb':
+            ipynb_to_py(args.input, args.output)
+        elif input_ext == '.py':
+            py_to_ipynb(args.input, args.output)
+        else:
+            print(f"Error: Unsupported file extension '{input_ext}'. Use .ipynb or .py",
+                  file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
